@@ -1,0 +1,12 @@
+# Ignore data and large files
+data/
+*.nii
+*.nii.gz
+*.csv
+*.pt
+*.log
+*.h5
+
+# System files
+.DS_Store
+*.swp
