@@ -1,0 +1,1383 @@
+# %%
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GridSearchCV, GroupKFold, cross_val_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sklearn.metrics import make_scorer, f1_score, roc_auc_score, accuracy_score
+from sklearn.pipeline import Pipeline
+from IPython.display import display
+
+import sys
+import os
+from pathlib import Path
+import importlib
+
+import nibabel as nib
+import tqdm
+
+
+# %%
+#Segmented Data with volumetric features and DICE scores 
+filepath = "/gpfs/data/oermannlab/users/schula12/Morphology/Lumiere/InTheSheets/patients_cases_true_lesion_analysis_CORRECTED_IDs_CLEAN.csv"
+df = pd.read_csv(filepath)
+# Print columns in a more readable, wrapped format
+import textwrap
+cols = list(df.columns)
+import ipywidgets as widgets
+from IPython.display import display
+
+#wrapped_cols = "\n".join(textwrap.wrap(", ".join(cols), width=120))
+#accordion = widgets.Accordion(children=[widgets.Output()])
+#accordion.set_title(0, 'Show/Hide Columns of Morph Dataset')
+#with accordion.children[0]:
+#    print(wrapped_cols)
+#display(accordion)
+display(df.head())
+print(f"The dataframe has {len(df.columns)} columns.")
+
+
+print()  # Add a blank line for spacing
+print("This is the clinical data")
+
+#clinical data 
+clin_df = pd.read_csv("/gpfs/data/oermannlab/users/schula12/all_fractal_results/LUMIERE-Demographics_Pathology.csv")
+print (list(clin_df.columns))
+
+display(clin_df.head())
+print(f"The dataframe has {len(clin_df.columns)} columns.")
+
+
+# %%
+
+
+# Add the 'scripts' folder to the Python path
+scripts_path = os.path.join(os.getcwd(), "scripts")
+if scripts_path not in sys.path:
+    sys.path.append(scripts_path)
+
+# Import and reload utils to ensure fresh copy
+import utils
+importlib.reload(utils)
+
+# Import functions from utils
+from utils import encode_categorical_columns, decode_column
+from MorphFeatureClass import TumorMorphology
+
+
+# %%
+columns_to_encode = [
+    "Sex", 
+    "IDH (WT: wild type)", 
+    "MGMT qualitative"
+]
+
+clin_df, encodings = encode_categorical_columns(clin_df, columns_to_encode)
+
+# Now `df` has new columns like:
+# - sex_numerical
+# - idh_wt_wild_type_numerical
+# - mgmt_qualitative_numerical
+
+print(encodings)  # See what values got mapped to what integers
+display(clin_df.head(2))
+
+cols = ["Sex", "IDH (WT: wild type)", "MGMT qualitative"]
+
+for col in cols:
+    clean_col_name = col.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(":", "")
+    num_col = f"{clean_col_name}_numerical"
+
+    print(f"\n{col}")
+    print("Unique original values:", clin_df[col].dropna().unique())
+    print("Unique encoded values:", clin_df[num_col].dropna().unique())
+
+
+
+# %%
+# Merge clinical data into df_merged so that each row (patient_id, case_id) has clinical info
+
+# First, ensure the clinical DataFrame has a column named 'patient_id' to match df_merged
+# If the clinical DataFrame is called 'clinical_df' and has 'Patient' as the patient ID column:
+if 'Patient' in clin_df.columns and 'patient_id' not in clin_df.columns:
+    clinical_df = clin_df.rename(columns={'Patient': 'patient_id'})
+
+# Merge on 'patient_id' (left join to preserve all imaging/case rows)
+merged_df = df.merge(clinical_df, on='patient_id', how='left')
+# View the result
+# Convert 'Sex' column to binary float: 1.0 for female, 0.0 for male (NaN for others)
+def sex_to_binary_float(x):
+    if isinstance(x, str):
+        if x.strip().lower() == "female":
+            return 1.0
+        elif x.strip().lower() == "male":
+            return 0.0
+    return float('nan')
+
+merged_df["sex_binary"] = merged_df["Sex"].apply(sex_to_binary_float)
+print(list(merged_df.columns))
+
+merged_df.head()
+
+
+
+
+# %% [markdown]
+# ### Morphological Feature Extraction Guide
+# 
+# Use the `compute_morph_features()` function from `utils.py` to extract 3D morphological biomarkers from segmentation masks of tumor regions.
+# 
+# ---
+# #### Available Features
+# You can compute any combination of the following features:
+# | Feature         | Description                                                                 |
+# |-----------------|-----------------------------------------------------------------------------|
+# | `"volume"`       | Voxel count of the region (i.e., raw tumor size)                           |
+# | `"surface_area"` | Estimated 3D surface area                                                   |
+# | `"compactness"`  | Shape descriptor: volume² / surface³                                       |
+# | `"fractal"`      | 3D fractal dimension (via GPU-accelerated box-counting)                    |
+# | `"lacunarity"`   | Spatial heterogeneity / gap distribution in the structure                  |
+# | `"lesion"`       | Connected components: lesion count, mean and max lesion size               |
+# 
+# ---
+# #### How to Use
+# 
+# ```python
+# 
+# from utils import compute_morph_features
+# 
+# features = ["fractal", "compactness", "lacunarity", "lesion"]
+# 
+# # Whole tumor computation (merged mask of all tumor labels)
+# results_whole = compute_morph_features(merged_df, features_to_compute=features, per_region=False)
+# 
+# # Per-region computation (label_1 = enhancing, label_2 = necrotic, label_3 = edema)
+# results_region = compute_morph_features(merged_df, features_to_compute=features, per_region=True)
+# 
+# # Optional: Convert to DataFrame
+# df_region = pd.DataFrame(results_region)
+# df_region.head()
+# 
+# ```
+# 
+# ---
+# 
+# #### Check Which Features Already Exist
+# 
+# Before recomputing features, check if they're already present:
+# 
+# ```python
+# 
+# from utils import check_existing_morph_features
+# 
+# check_existing_morph_features(merged_df)
+# 
+# ```
+# 
+# This will output a categorized list like:
+# 
+# ```
+# 📊 Morphological Features Present in DataFrame:
+# 
+# 🔹 compactness (6):
+#    - compactness_label_1
+#    - compactness_label_2
+#    - compactness_whole
+#    ...
+# 
+# 🔹 fractal_3d (6):
+#    - fractal_label_1
+#    - fractal_label_2
+#    - fractal_whole
+#    ...
+# ```
+# 
+# ---
+# ####  Output Format
+# The resulting DataFrame from `compute_morph_features()` will contain rows like:
+# 
+# - `region`: `"whole"` for combined tumor or `"label_1"` / `"label_2"` / `"label_3"` for specific tumor subregions  
+# - `timepoint`: `"baseline"` or `"followup"`
+# 
+# ---
+# #### 💡 Notes
+# 
+# - Running `per_region=True` will compute metrics **separately for enhancing, necrotic, and edema regions**.
+# - You can re-run the function safely: it will **skip features already in the DataFrame** (if implemented with checking).
+# - Internally uses the GPU-accelerated `TumorMorphology` class defined in `MorphFeatureClass.py`.
+# - Use `to_csv()` to export results, or `merge()` back into your main dataset.
+# 
+# ---
+# Let me know if you want to compute morphological **changes over time**, lesion **emergence or loss**, or need a visualization!
+# 
+
+# %%
+# 1. Import
+import importlib
+import utils
+importlib.reload(utils)
+
+from utils import compute_morph_features, check_existing_morph_features
+
+# 2. Check what morphological features are already in your main dataframe
+check_existing_morph_features(merged_df)
+
+# 3. Define which features you want to compute
+#the options are: ['fractal', 'lacunarity', 'surface_area', 'compactness', 'volume', 'lesion']
+features = ['fractal', 'lacunarity', 'surface_area', 'compactness']
+
+# 4. Run the modular morph feature computation
+morph_df = compute_morph_features(
+    merged_df,
+    features_to_compute=features,
+    per_region=True  # or False for whole tumor only
+)
+
+# 5. (Optional) Save or merge the result
+#morph_df.to_csv("modular_morph_features.csv", index=False)
+
+# To merge:
+#merged_df = pd.merge(merged_df, morph_df, on=["patient_id", "case_id"], how="left")
+
+# 6. Inspect the results
+
+
+# %%
+
+
+morph_df = pd.read_csv("/gpfs/data/oermannlab/users/schula12/TumorMorph/fractal_region_morph_features.csv")
+print(type(morph_df))
+if isinstance(morph_df, pd.DataFrame):
+    display(morph_df.head())
+
+
+# %%
+# Merge morph_df into merged_df on patient_id and case_id
+merged_df = pd.merge(merged_df, morph_df, on=["patient_id", "case_id"], how="left")
+display(merged_df)
+
+# %% [markdown]
+# # Add columns of change and volatility (this will become a separate script)
+
+# %%
+import importlib
+import utils
+importlib.reload(utils)
+
+from utils import get_available_morph_features, add_volume_change_features, statistical_analysis_of_changes, compute_morph_deltas
+features, region_map, existing_deltas = get_available_morph_features(merged_df)
+print(features)
+print(region_map)
+print(existing_deltas)
+
+# %%
+from utils import compute_morph_deltas, get_available_morph_features
+
+# 1. Get available features and regions
+features, region_map, existing_deltas = get_available_morph_features(merged_df)
+
+# 2. Compute change/volatility only for features that are missing
+merged_df = compute_morph_deltas(merged_df, region_map, existing_deltas)
+
+# 3. Inspect result
+merged_df[[col for col in merged_df.columns if col.endswith("_change") or col.endswith("_volatility")]].head()
+
+
+# %%
+features_to_compare = ["whole_tumor_volume", "edema_volume", "necrotic_volume", "enhancing_volume"]  # or add more like ["edema_volume", "necrotic_volume"]
+region_df = add_volume_change_features(merged_df, features_to_compare)
+display(region_df)
+# Merge region_df back into merged_df on patient_id and case_id, adding new columns with suffixes to avoid overwriting
+merged_df = pd.merge(merged_df, region_df, on=["patient_id", "case_id"], how="left", suffixes=('', '_region'))
+display(list(merged_df.columns))
+
+# %%
+# Save the merged_df to a CSV file for later use
+merged_df.to_csv("all_fractal_morphology_features.csv", index=False)
+
+
+# %%
+import importlib
+import utils
+importlib.reload(utils)
+
+from utils import get_all_morph_feature_columns
+
+all_morph_cols = get_all_morph_feature_columns(merged_df, include_deltas=True)
+print(all_morph_cols)
+
+
+# %%
+for feat in all_morph_cols:
+    print(f"🧪 Analyzing: {feat}")
+    statistical_analysis_of_changes(merged_df, feat)
+    print("-" * 50)
+
+
+# %%
+# Add a binary response column to merged_df.
+# If your response column is numeric (e.g., 3 = Response, 1/2 = PD/SD), use the lambda version:
+merged_df["binary_response"] = merged_df["response"].apply(lambda x: 1 if x == 3 else 0)
+print(merged_df["binary_response"].value_counts())
+
+
+# %% [markdown]
+# # Ablation Study Results - Which combos are we doing (from Minimal -> to All Features)
+
+# %%
+# Numerical Clinical Features (replace 'sex_binary' if already done)
+clinical_features_numerical = [
+    'sex_numerical',
+    'idh_wt_wild_type_numerical', 
+    'mgmt_qualitative_numerical'
+]
+
+# Top Morph Features (high statistical signal)
+top_morph_features = [
+    'fractal_baseline_label_1', 'fractal_baseline_label_2', 'fractal_baseline_label_3',
+    'fractal_followup_label_1', 'fractal_followup_label_2', 'fractal_followup_label_3',
+    'fractal_label_1_change', 'fractal_label_1_volatility',
+    'fractal_label_2_change', 'fractal_label_2_volatility',
+    'fractal_label_3_change', 'fractal_label_3_volatility'
+]
+
+# Lesion Features
+lesion_features = [
+    "swin_net_total_lesion_change",
+    "swin_enhancing_net_lesion_change",
+    "swin_edema_net_lesion_change",
+    "swin_necrotic_net_lesion_change"
+]
+
+# Baseline Morphology Features
+baseline_morph_features = [
+    "surface_area_baseline_whole", "compactness_baseline_whole",
+    "fractal_baseline_whole", "lacunarity_baseline_whole"
+]
+
+# Volume Features
+volume_delta_features = [
+    "whole_tumor_volume_change", "whole_tumor_volume_volatility",
+    "edema_volume_change", "edema_volume_volatility",
+    "necrotic_volume_change", "necrotic_volume_volatility",
+    "enhancing_volume_change", "enhancing_volume_volatility",
+]
+
+baseline_volume_features = [
+    "baseline_swin_enhancing_volume", "baseline_swin_necrotic_volume",
+    "baseline_swin_edema_volume", "baseline_swin_whole_tumor_volume"
+]
+
+# Define Ablation Setups
+ablation_setups = {
+    # Single types
+    "Clinical only": clinical_features_numerical,
+    "Volume ∆ only": volume_delta_features,
+    "Baseline Volume only": baseline_volume_features,
+    "Top Morph only": top_morph_features,
+    "Lesion Morph only": lesion_features,
+    #"Baseline Morph only": baseline_morph_features,
+
+    # Pairs
+    "Volume ∆ + Clinical": volume_delta_features + clinical_features_numerical,
+    "Volume ∆ + Baseline Volume": volume_delta_features + baseline_volume_features,
+    "Volume ∆ + Lesion": volume_delta_features + lesion_features,
+    "Volume ∆ + Top Morph": volume_delta_features + top_morph_features,
+    #"Baseline Vol + Clinical": baseline_volume_features + clinical_features_numerical,
+    ##"Baseline Vol + Lesion": baseline_volume_features + lesion_features,
+    #Baseline Vol + Top Morph": baseline_volume_features + top_morph_features,
+    "Top Morph + Clinical": top_morph_features + clinical_features_numerical,
+    #Lesion + Clinical": lesion_features + clinical_features_numerical,
+    #"Baseline Morph + Clinical": baseline_morph_features + clinical_features_numerical,
+
+    # Triads
+    "Vol ∆ + Baseline Vol + Top Morph": volume_delta_features + baseline_volume_features + top_morph_features,
+    "Vol ∆ + Lesion + Clinical": volume_delta_features + lesion_features + clinical_features_numerical,
+    "Baseline Vol + Lesion + Top Morph": baseline_volume_features + lesion_features + top_morph_features,
+    "Top Morph + Lesion + Clinical": top_morph_features + lesion_features + clinical_features_numerical,
+
+    # All
+    #"All features": volume_delta_features + baseline_volume_features + lesion_features + top_morph_features + baseline_morph_features + clinical_features_numerical
+}
+
+
+# %% [markdown]
+# # Classic ML Models
+
+# %%
+# Add this cell at the top of your notebook:
+import warnings
+warnings.filterwarnings('ignore')
+
+# Or specifically for LightGBM:
+import lightgbm as lgb
+
+# Define model setups
+model_setups = {
+    "RandomForest": (
+        RandomForestClassifier(class_weight="balanced", random_state=42),
+        {
+            "clf__n_estimators": [50, 100],
+            "clf__max_depth": [3, 5, None],
+            "clf__min_samples_split": [2, 5],
+            "clf__min_samples_leaf": [1, 2],
+            "clf__max_features": ["sqrt", "log2"],
+        }
+    ),
+    "LogisticRegression": (
+        LogisticRegression(class_weight="balanced", solver="liblinear", max_iter=1000),
+        {
+            "clf__C": [0.01, 0.1, 1, 10],
+            "clf__penalty": ["l1", "l2"]
+        }
+    ),
+    "SVC (RBF)": (
+        SVC(class_weight="balanced", probability=True),
+        {
+            "clf__C": [0.1, 1, 10],
+            "clf__gamma": ["scale", "auto"]
+        }
+    ),
+    "XGBoost": (
+        XGBClassifier(use_label_encoder=False, eval_metric="logloss"),
+        {
+            "clf__n_estimators": [50, 100],
+            "clf__max_depth": [3, 5],
+            "clf__learning_rate": [0.05, 0.1],
+        }
+    ),
+    # In your model_setups, update the LightGBM configuration:
+
+    "LightGBM": (
+        LGBMClassifier(
+            verbose=-1,           # Suppress all output
+            objective='binary',   # Explicitly set objective
+            boosting_type='gbdt', # Explicitly set boosting
+            force_col_wise=True   # Remove threading overhead warning
+        ),
+        {
+            "clf__n_estimators": [50, 100],
+            "clf__num_leaves": [15, 31],
+            "clf__learning_rate": [0.05, 0.1],
+        }
+)
+}
+
+
+
+# %%
+# Quick test using your actual model_setups
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Create test data
+X, y = make_classification(n_samples=200, n_features=10, n_classes=2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+print("🔍 Testing LightGBM from your model_setups:")
+
+# Get LightGBM from your model_setups
+lgb_model, lgb_params = model_setups["LightGBM"]
+
+# Create pipeline (same as your ablation study)
+pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("clf", lgb_model)
+])
+
+# Fit with one parameter combination
+pipe.set_params(clf__n_estimators=50, clf__num_leaves=15)
+pipe.fit(X_train, y_train)
+
+pred = pipe.predict(X_test)
+accuracy = (pred == y_test).mean()
+
+print(f"✅ Test completed - Accuracy: {accuracy:.3f}")
+print("If you see minimal/no LightGBM warnings above, your model_setups configuration works!")
+
+# %%
+
+
+# %% [markdown]
+# # Classic ML training and ablation
+
+# %%
+from sklearn.model_selection import GroupShuffleSplit
+
+def split_train_test_by_group(df, group_column="patient_id", test_size=0.2, random_state=42):
+    """
+    Splits a DataFrame into train and test sets by grouping on a patient or subject ID.
+    Ensures no group (e.g., patient_id) appears in both train and test.
+
+    Parameters:
+        df (pd.DataFrame): The full dataset
+        group_column (str): Column name to group by (usually "patient_id")
+        test_size (float): Fraction of groups to assign to test set
+        random_state (int): Seed for reproducibility
+
+    Returns:
+        df_train (pd.DataFrame), df_test (pd.DataFrame)
+    """
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    groups = df[group_column]
+    train_idx, test_idx = next(splitter.split(df, groups=groups))
+    return df.iloc[train_idx].copy(), df.iloc[test_idx].copy()
+
+df_train, df_test = split_train_test_by_group(merged_df)
+
+# Sanity check for patient ID overlap
+overlap = set(df_train["patient_id"]) & set(df_test["patient_id"])
+print(f"❌ Overlapping patient_ids: {len(overlap)}" if overlap else "✅ No patient overlap — split is safe.")
+
+
+# %%
+print("\ndf_train head:")
+print(list(df_train.columns))
+df_train.head()
+
+# %%
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+import os
+import re
+import json
+import numpy as np
+import pandas as pd
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GroupKFold, GridSearchCV, cross_validate
+from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+from joblib import dump
+
+results = []
+all_test_predictions = []
+
+# Ensure save directory exists
+os.makedirs("saved_models", exist_ok=True)
+
+# Outer loop for ablation setups
+for setup_name, features in tqdm(ablation_setups.items(), desc="🔬 Ablation Setups"):
+    df_clean = df_train.dropna(subset=features + ["binary_response", "patient_id"])
+    X = df_clean[features]
+    y = df_clean["binary_response"]
+    groups = df_clean["patient_id"]
+
+    print(f"\n📊 Evaluating setup: {setup_name} — {len(X)} samples")
+
+    # Inner loop for each model
+    for model_name, (model, param_grid) in tqdm(model_setups.items(), desc=f"⚙️ Models for {setup_name}", leave=False):
+        print(f"\n🔍 Tuning model: {model_name}...")
+
+        pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", model)
+        ])
+
+        gkf = GroupKFold(n_splits=5)
+
+        # Grid search to find best hyperparameters
+        grid = GridSearchCV(
+            pipe, param_grid=param_grid,
+            cv=gkf, scoring="f1_macro",
+            n_jobs=-1, verbose=0
+        )
+
+        grid.fit(X, y, groups=groups)
+        best_model = grid.best_estimator_
+
+        # CORRECT EVALUATION: Get both train and validation scores from CV
+        cv_results = cross_validate(
+            best_model, X, y, 
+            cv=gkf, 
+            groups=groups, 
+            scoring="f1_macro",
+            return_train_score=True  # This is key!
+        )
+
+        # Proper CV metrics
+        cv_train_f1 = np.mean(cv_results['train_score'])  # Training score within CV
+        cv_val_f1 = np.mean(cv_results['test_score'])     # Validation score within CV
+        cv_val_std = np.std(cv_results['test_score'])      # Standard deviation of CV validation scores
+
+        # Refit on entire training set for final model
+        best_model.fit(X, y)
+        train_preds = best_model.predict(X)
+        train_proba = best_model.predict_proba(X)[:, 1]
+        
+        # Full training set metrics (these should be very high - model has seen this data)
+        train_f1_full = f1_score(y, train_preds, average='macro')
+        train_roc_auc = roc_auc_score(y, train_proba)
+        train_acc = accuracy_score(y, train_preds)
+
+        # Test set evaluation (true holdout performance)
+        df_test_clean = df_test.dropna(subset=features + ["binary_response", "patient_id"])
+        X_test = df_test_clean[features]
+        y_test = df_test_clean["binary_response"]
+
+        y_test_pred = best_model.predict(X_test)
+        y_test_proba = best_model.predict_proba(X_test)[:, 1]
+
+        test_f1 = f1_score(y_test, y_test_pred, average='macro')
+        test_roc_auc = roc_auc_score(y_test, y_test_proba)
+        test_acc = accuracy_score(y_test, y_test_pred)
+
+        # Calculate meaningful overfitting metrics
+        cv_overfit_gap = cv_train_f1 - cv_val_f1  # Within CV
+        generalization_gap = cv_val_f1 - test_f1   # CV to test set
+
+        print(f"✅ {model_name}")
+        print(f"   CV: Train F1={cv_train_f1:.4f}, Val F1={cv_val_f1:.4f} (±{cv_val_std:.4f})")
+        print(f"   Test: F1={test_f1:.4f}, ROC-AUC={test_roc_auc:.4f}")
+        print(f"   Overfitting: CV gap={cv_overfit_gap:.4f}, Generalization gap={generalization_gap:.4f}")
+
+        # Record summary with CORRECTED metrics
+        results.append({
+            "Setup": setup_name,
+            "Model": model_name,
+            # Cross-validation metrics (most reliable for model selection)
+            "CV_Val_F1": cv_val_f1,           # This is your main metric for comparing models
+            "CV_Val_F1_std": cv_val_std,      # Variability across folds
+            "CV_Train_F1": cv_train_f1,       # Training performance within CV
+            "CV_Overfit_Gap": cv_overfit_gap, # cv_train - cv_val
+            
+            # Full training set metrics (after final refit)
+            "Train_F1_Full": train_f1_full,   # Should be very high
+            "Train_ROC_AUC": train_roc_auc,
+            "Train_Accuracy": train_acc,
+            
+            # Test set metrics (true holdout)
+            "Test_F1": test_f1,
+            "Test_ROC_AUC": test_roc_auc,
+            "Test_Accuracy": test_acc,
+            
+            # Generalization metrics
+            "Generalization_Gap": generalization_gap,  # cv_val - test
+            "Total_Overfit": cv_train_f1 - test_f1    # Total drop from CV train to test
+        })
+
+        # Save test predictions (optional)
+        test_prediction_rows = pd.DataFrame({
+            "patient_id": df_test_clean["patient_id"].values,
+            "true_label": y_test,
+            "pred_label": y_test_pred,
+            "pred_proba": y_test_proba,
+            "model": model_name,
+            "setup": setup_name
+        })
+        all_test_predictions.append(test_prediction_rows)
+
+        # === SAVE BEST MODEL + PARAMS ===
+        clean_setup = re.sub(r"[^a-zA-Z0-9]+", "_", setup_name)
+        clean_model = re.sub(r"[^a-zA-Z0-9]+", "_", model_name)
+
+        base_name = f"{clean_setup}_{clean_model}"
+        model_path = f"saved_models/model_{base_name}.joblib"
+        param_path = f"saved_models/params_{base_name}.json"
+        metrics_path = f"saved_models/metrics_{base_name}.json"
+
+        # Save model
+        dump(best_model, model_path)
+
+        # Save parameters
+        with open(param_path, "w") as f:
+            json.dump(grid.best_params_, f, indent=4)
+        
+        # Save metrics for this specific model
+        model_metrics = {
+            "setup": setup_name,
+            "model": model_name,
+            "best_params": grid.best_params_,
+            "cv_val_f1": cv_val_f1,
+            "cv_train_f1": cv_train_f1,
+            "test_f1": test_f1,
+            "test_roc_auc": test_roc_auc,
+            "cv_overfit_gap": cv_overfit_gap,
+            "generalization_gap": generalization_gap
+        }
+        with open(metrics_path, "w") as f:
+            json.dump(model_metrics, f, indent=4)
+
+# Convert results to DataFrame
+results_df = pd.DataFrame(results)
+
+# Save results
+results_df.to_csv("ablation_results_1.csv", index=False)
+print(f"\n📊 Results saved to 'ablation_results_1.csv'")
+
+# Save all test predictions
+if all_test_predictions:
+    all_test_preds_df = pd.concat(all_test_predictions, ignore_index=True)
+    all_test_preds_df.to_csv("all_test_predictions_1.csv", index=False)
+    print(f"🎯 Test predictions saved to 'all_test_predictions_1.csv'")
+
+# Print summary statistics
+print("\n" + "="*60)
+print("FINAL SUMMARY")
+print("="*60)
+
+# Best models by CV validation F1
+best_by_cv = results_df.nlargest(5, 'CV_Val_F1')[['Setup', 'Model', 'CV_Val_F1', 'Test_F1', 'CV_Overfit_Gap']]
+print("\nTop 5 Models by Cross-Validation F1:")
+print(best_by_cv.to_string(index=False))
+
+# Check for any remaining anomalies
+anomalies = results_df[results_df['Test_F1'] > results_df['CV_Train_F1']]
+if len(anomalies) > 0:
+    print(f"\n⚠️ WARNING: {len(anomalies)} cases where Test > CV_Train (investigate these)")
+    print(anomalies[['Model', 'Setup', 'CV_Train_F1', 'Test_F1']].head())
+else:
+    print("\n✅ No anomalies detected (Test never exceeds CV Train)")
+
+# Overall statistics
+print(f"\nOverall Performance:")
+print(f"  Avg CV Val F1: {results_df['CV_Val_F1'].mean():.3f} (±{results_df['CV_Val_F1'].std():.3f})")
+print(f"  Avg Test F1: {results_df['Test_F1'].mean():.3f} (±{results_df['Test_F1'].std():.3f})")
+print(f"  Avg CV Overfitting: {results_df['CV_Overfit_Gap'].mean():.3f}")
+print(f"  Avg Generalization Gap: {results_df['Generalization_Gap'].mean():.3f}")
+
+# %%
+def run_ablation_pipeline(
+    ablation_setups,
+    model_setups,
+    df_train,
+    df_test,
+    save_prefix="1",
+    results_dir="saved_models"
+):
+    from tqdm import tqdm
+    import os, re, json
+    import numpy as np
+    import pandas as pd
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import GroupKFold, GridSearchCV, cross_validate
+    from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+    from joblib import dump
+
+    os.makedirs(results_dir, exist_ok=True)
+    results = []
+    all_test_predictions = []
+
+    for setup_name, features in tqdm(ablation_setups.items(), desc="🔬 Ablation Setups"):
+        df_clean = df_train.dropna(subset=features + ["response", "patient_id"])
+        X = df_clean[features]
+        y = df_clean["binary_response"]
+        groups = df_clean["patient_id"]
+
+        print(f"\n📊 Evaluating setup: {setup_name} — {len(X)} samples")
+
+        for model_name, (model, param_grid) in tqdm(model_setups.items(), desc=f"⚙️ Models for {setup_name}", leave=False):
+            print(f"\n🔍 Tuning model: {model_name}...")
+
+            pipe = Pipeline([
+                ("scaler", StandardScaler()),
+                ("clf", model)
+            ])
+
+            gkf = GroupKFold(n_splits=5)
+
+            grid = GridSearchCV(pipe, param_grid=param_grid, cv=gkf, scoring="f1_macro", n_jobs=-1, verbose=0)
+            grid.fit(X, y, groups=groups)
+            best_model = grid.best_estimator_
+
+            cv_results = cross_validate(
+                best_model, X, y, cv=gkf, groups=groups,
+                scoring="f1_macro", return_train_score=True
+            )
+
+            cv_train_f1 = np.mean(cv_results['train_score'])
+            cv_val_f1 = np.mean(cv_results['test_score'])
+            cv_val_std = np.std(cv_results['test_score'])
+
+            best_model.fit(X, y)
+            train_preds = best_model.predict(X)
+            train_proba = best_model.predict_proba(X)[:, 1]
+
+            train_f1_full = f1_score(y, train_preds, average='macro')
+            train_roc_auc = roc_auc_score(y, train_proba)
+            train_acc = accuracy_score(y, train_preds)
+
+            df_test_clean = df_test.dropna(subset=features + ["binary_response", "patient_id"])
+            X_test = df_test_clean[features]
+            y_test = df_test_clean["binary_response"]
+
+            y_test_pred = best_model.predict(X_test)
+            y_test_proba = best_model.predict_proba(X_test)[:, 1]
+
+            test_f1 = f1_score(y_test, y_test_pred, average='macro')
+            test_roc_auc = roc_auc_score(y_test, y_test_proba)
+            test_acc = accuracy_score(y_test, y_test_pred)
+
+            cv_overfit_gap = cv_train_f1 - cv_val_f1
+            generalization_gap = cv_val_f1 - test_f1
+
+            print(f"✅ {model_name}")
+            print(f"   CV: Train F1={cv_train_f1:.4f}, Val F1={cv_val_f1:.4f} (±{cv_val_std:.4f})")
+            print(f"   Test: F1={test_f1:.4f}, ROC-AUC={test_roc_auc:.4f}")
+            print(f"   Overfitting: CV gap={cv_overfit_gap:.4f}, Generalization gap={generalization_gap:.4f}")
+
+            results.append({
+                "Setup": setup_name,
+                "Model": model_name,
+                "CV_Val_F1": cv_val_f1,
+                "CV_Val_F1_std": cv_val_std,
+                "CV_Train_F1": cv_train_f1,
+                "CV_Overfit_Gap": cv_overfit_gap,
+                "Train_F1_Full": train_f1_full,
+                "Train_ROC_AUC": train_roc_auc,
+                "Train_Accuracy": train_acc,
+                "Test_F1": test_f1,
+                "Test_ROC_AUC": test_roc_auc,
+                "Test_Accuracy": test_acc,
+                "Generalization_Gap": generalization_gap,
+                "Total_Overfit": cv_train_f1 - test_f1
+            })
+
+            test_prediction_rows = pd.DataFrame({
+                "patient_id": df_test_clean["patient_id"].values,
+                "true_label": y_test,
+                "pred_label": y_test_pred,
+                "pred_proba": y_test_proba,
+                "model": model_name,
+                "setup": setup_name
+            })
+            all_test_predictions.append(test_prediction_rows)
+
+            # Save paths
+            clean_setup = re.sub(r"[^a-zA-Z0-9]+", "_", setup_name)
+            clean_model = re.sub(r"[^a-zA-Z0-9]+", "_", model_name)
+            base_name = f"{clean_setup}_{clean_model}_{save_prefix}"
+
+            dump(best_model, os.path.join(results_dir, f"model_{base_name}.joblib"))
+            with open(os.path.join(results_dir, f"params_{base_name}.json"), "w") as f:
+                json.dump(grid.best_params_, f, indent=4)
+            with open(os.path.join(results_dir, f"metrics_{base_name}.json"), "w") as f:
+                json.dump({
+                    "setup": setup_name,
+                    "model": model_name,
+                    "best_params": grid.best_params_,
+                    "cv_val_f1": cv_val_f1,
+                    "cv_train_f1": cv_train_f1,
+                    "test_f1": test_f1,
+                    "test_roc_auc": test_roc_auc,
+                    "cv_overfit_gap": cv_overfit_gap,
+                    "generalization_gap": generalization_gap
+                }, f, indent=4)
+
+    # Final results dataframe
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(f"ablation_results_{save_prefix}.csv", index=False)
+    print(f"\n📊 Results saved to 'ablation_results_{save_prefix}.csv'")
+
+    if all_test_predictions:
+        all_preds_df = pd.concat(all_test_predictions, ignore_index=True)
+        all_preds_df.to_csv(f"all_test_predictions_{save_prefix}.csv", index=False)
+        print(f"🎯 Test predictions saved to 'all_test_predictions_{save_prefix}.csv'")
+
+    # Summary
+    print("\n" + "="*60)
+    print("FINAL SUMMARY")
+    print("="*60)
+
+    best_by_cv = results_df.nlargest(5, 'CV_Val_F1')[['Setup', 'Model', 'CV_Val_F1', 'Test_F1', 'CV_Overfit_Gap']]
+    print("\nTop 5 Models by Cross-Validation F1:")
+    print(best_by_cv.to_string(index=False))
+
+    anomalies = results_df[results_df['Test_F1'] > results_df['CV_Train_F1']]
+    if len(anomalies) > 0:
+        print(f"\n⚠️ WARNING: {len(anomalies)} cases where Test > CV_Train (investigate these)")
+        print(anomalies[['Model', 'Setup', 'CV_Train_F1', 'Test_F1']].head())
+    else:
+        print("\n✅ No anomalies detected (Test never exceeds CV Train)")
+
+    print(f"\nOverall Performance:")
+    print(f"  Avg CV Val F1: {results_df['CV_Val_F1'].mean():.3f} (±{results_df['CV_Val_F1'].std():.3f})")
+    print(f"  Avg Test F1: {results_df['Test_F1'].mean():.3f} (±{results_df['Test_F1'].std():.3f})")
+    print(f"  Avg CV Overfitting: {results_df['CV_Overfit_Gap'].mean():.3f}")
+    print(f"  Avg Generalization Gap: {results_df['Generalization_Gap'].mean():.3f}")
+
+    return results_df
+
+
+# %%
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+
+# Set professional plotting style
+plt.style.use('seaborn-v0_8-whitegrid')
+plt.rcParams['figure.figsize'] = (20, 8)
+plt.rcParams['font.size'] = 12
+plt.rcParams['axes.titlesize'] = 16
+plt.rcParams['axes.labelsize'] = 14
+
+def load_and_analyze_data():
+    """Load and analyze all three experimental datasets"""
+    
+    # Load the actual CSV files
+    df_traditional = pd.read_csv('ablation_results_1.csv')
+    df_temporal = pd.read_csv('ablation_results_corrected.csv')  
+    df_strategic = pd.read_csv('ablation_results_fractal_only.csv')
+    
+    # Find the single best performer from each dataset
+    best_performers = []
+    
+    # Best from first dataset
+    best_idx_1 = df_traditional['Test_F1'].idxmax()
+    best_1 = df_traditional.loc[best_idx_1]
+    best_performers.append({
+        'setup': best_1['Setup'],
+        'model': best_1['Model'],
+        'test_f1': best_1['Test_F1'],
+        'test_auc': best_1['Test_ROC_AUC'],
+        'total_overfit': best_1['Total_Overfit'],
+        'dataset': 'Dataset 1'
+    })
+    
+    # Best from second dataset
+    best_idx_2 = df_temporal['Test_F1'].idxmax()
+    best_2 = df_temporal.loc[best_idx_2]
+    best_performers.append({
+        'setup': best_2['Setup'],
+        'model': best_2['Model'],
+        'test_f1': best_2['Test_F1'],
+        'test_auc': best_2['Test_ROC_AUC'],
+        'total_overfit': best_2['Total_Overfit'],
+        'dataset': 'Dataset 2'
+    })
+    
+    # Best from third dataset
+    best_idx_3 = df_strategic['Test_F1'].idxmax()
+    best_3 = df_strategic.loc[best_idx_3]
+    best_performers.append({
+        'setup': best_3['Setup'],
+        'model': best_3['Model'],
+        'test_f1': best_3['Test_F1'],
+        'test_auc': best_3['Test_ROC_AUC'],
+        'total_overfit': best_3['Total_Overfit'],
+        'dataset': 'Dataset 3'
+    })
+    
+    # Add the specific Vol Δ + Lesion + Clinical combination from first dataset
+    vol_lesion_clinical = df_traditional[df_traditional['Setup'] == 'Vol ∆ + Lesion + Clinical']
+    if len(vol_lesion_clinical) > 0:
+        best_vlc = vol_lesion_clinical.loc[vol_lesion_clinical['Test_F1'].idxmax()]
+        best_performers.append({
+            'setup': best_vlc['Setup'],
+            'model': best_vlc['Model'],
+            'test_f1': best_vlc['Test_F1'],
+            'test_auc': best_vlc['Test_ROC_AUC'],
+            'total_overfit': best_vlc['Total_Overfit'],
+            'dataset': 'Dataset 1'
+        })
+    
+    return pd.DataFrame(best_performers), [df_traditional, df_temporal, df_strategic]
+
+def create_supervisor_comparison():
+    """Create comprehensive comparison chart for supervisor"""
+    
+    # Load and analyze data
+    best_df, all_datasets = load_and_analyze_data()
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 8))
+    
+    # Colors for each experiment
+    colors = ['#2E86AB', '#A23B72', '#F18F01', '#28A745']  # Blue, Purple, Orange, Green
+    
+    # Plot 1: Best F1 Performance - use actual setup names
+    setup_labels = []
+    for _, row in best_df.iterrows():
+        # Use actual setup names, break long ones into multiple lines
+        setup = row['setup']
+        if len(setup) > 15:
+            # Break long setup names
+            words = setup.split(' ')
+            if len(words) > 2:
+                mid = len(words) // 2
+                setup_label = ' '.join(words[:mid]) + '\n' + ' '.join(words[mid:])
+            else:
+                setup_label = setup
+        else:
+            setup_label = setup
+        setup_labels.append(setup_label)
+    
+    bars1 = ax1.bar(range(len(best_df)), best_df['test_f1'], color=colors[:len(best_df)], 
+                   alpha=0.8, edgecolor='black', linewidth=1)
+    
+    # Add value labels
+    for i, (bar, row) in enumerate(zip(bars1, best_df.itertuples())):
+        height = bar.get_height()
+        # F1 score on top
+        ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'F1={height:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
+        # AUC score below
+        ax1.text(bar.get_x() + bar.get_width()/2., height - 0.05,
+                f'AUC={row.test_auc:.3f}', ha='center', va='top', fontsize=10, style='italic')
+    
+    ax1.set_ylabel('Test F1 Score', fontsize=14, fontweight='bold')
+    ax1.set_title('Best Performing Models', fontsize=16, fontweight='bold', pad=20)
+    ax1.set_xticks(range(len(best_df)))
+    ax1.set_xticklabels(setup_labels, fontsize=10)
+    ax1.set_ylim(0, max(best_df['test_f1']) * 1.2)
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # Add model info as text below the chart
+    model_info = []
+    for _, row in best_df.iterrows():
+        model_info.append(f"{row['model']} ({row['dataset']})")
+    
+    # Add model info as subtitle
+    fig.text(0.167, 0.02, '\n'.join([f"{i+1}. {info}" for i, info in enumerate(model_info)]), 
+             fontsize=9, ha='left', va='bottom', style='italic')
+    
+    # Highlight winner
+    winner_idx = best_df['test_f1'].idxmax()
+    ax1.annotate('🏆 WINNER', xy=(winner_idx, best_df.iloc[winner_idx]['test_f1']), 
+                xytext=(winner_idx, best_df.iloc[winner_idx]['test_f1'] * 1.15),
+                ha='center', fontsize=12, fontweight='bold', color='red',
+                arrowprops=dict(arrowstyle='->', color='red', lw=2))
+    
+    # Plot 2: Performance Range Analysis - use actual datasets
+    datasets = ['ablation_results_1.csv', 'ablation_results_corrected.csv', 'ablation_results_fractal_only.csv']
+    dataset_names = ['Dataset 1', 'Dataset 2', 'Dataset 3']
+    
+    range_data = []
+    for i, (df, name) in enumerate(zip(all_datasets, dataset_names)):
+        range_data.append({
+            'dataset': name,
+            'min': df['Test_F1'].min(),
+            'mean': df['Test_F1'].mean(), 
+            'max': df['Test_F1'].max(),
+            'unique_setups': df['Setup'].nunique()
+        })
+    
+    range_df = pd.DataFrame(range_data)
+    x_pos = np.arange(len(range_df))
+    
+    # Create range visualization
+    ax2.bar(x_pos, range_df['max'], color=colors[:len(range_df)], alpha=0.3, label='Range (min-max)')
+    ax2.bar(x_pos, range_df['mean'], color=colors[:len(range_df)], alpha=0.8, label='Average Performance')
+    
+    # Add value labels
+    for i, row in range_df.iterrows():
+        ax2.text(i, row['max'] + 0.02, f'Max: {row["max"]:.3f}', ha='center', fontweight='bold', fontsize=10)
+        ax2.text(i, row['mean'] + 0.01, f'Avg: {row["mean"]:.3f}', ha='center', fontsize=10)
+        ax2.text(i, row['min'] - 0.03, f'Min: {row["min"]:.3f}', ha='center', fontsize=9, style='italic')
+    
+    ax2.set_ylabel('F1 Score Range', fontsize=14, fontweight='bold')
+    ax2.set_title('Performance Distribution Across Datasets', fontsize=16, fontweight='bold', pad=20)
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels([f'{row["dataset"]}\n({row["unique_setups"]} setups)' for _, row in range_df.iterrows()], fontsize=10)
+    ax2.set_ylim(0, range_df['max'].max() * 1.2)
+    ax2.grid(axis='y', alpha=0.3)
+    ax2.legend(loc='upper left')
+    
+    # Plot 3: Overfitting Analysis
+    bars3 = ax3.bar(range(len(best_df)), best_df['total_overfit'], color=colors[:len(best_df)], 
+                   alpha=0.8, edgecolor='black', linewidth=1)
+    
+    # Add labels and assessments
+    for i, (bar, row) in enumerate(zip(bars3, best_df.itertuples())):
+        height = bar.get_height()
+        # Overfitting value
+        ax3.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'{height:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
+        
+        # Assessment
+        if height < 0.15:
+            assessment, color = "Excellent", 'green'
+        elif height < 0.25:
+            assessment, color = "Good", 'orange'
+        else:
+            assessment, color = "Moderate", 'red'
+            
+        ax3.text(bar.get_x() + bar.get_width()/2., height - 0.03,
+                assessment, ha='center', va='top', fontsize=10, 
+                style='italic', color=color, fontweight='bold')
+    
+    # Reference lines
+    ax3.axhline(y=0.15, color='green', linestyle='--', alpha=0.5, label='Excellent (<0.15)')
+    ax3.axhline(y=0.25, color='orange', linestyle='--', alpha=0.5, label='Good (<0.25)')
+    
+    ax3.set_ylabel('Total Overfitting', fontsize=14, fontweight='bold')
+    ax3.set_title('Overfitting Analysis\n(Lower is Better)', fontsize=16, fontweight='bold', pad=20)
+    ax3.set_xticks(range(len(best_df)))
+    ax3.set_xticklabels(setup_labels, fontsize=10)
+    ax3.set_ylim(0, max(best_df['total_overfit']) * 1.3)
+    ax3.grid(axis='y', alpha=0.3)
+    ax3.legend(loc='upper right', fontsize=10)
+    
+    # Highlight best generalization
+    best_overfit_idx = best_df['total_overfit'].idxmin()
+    ax3.annotate('🎯 BEST', xy=(best_overfit_idx, best_df.iloc[best_overfit_idx]['total_overfit']), 
+                xytext=(best_overfit_idx, best_df.iloc[best_overfit_idx]['total_overfit'] + 0.08),
+                ha='center', fontsize=12, fontweight='bold', color='green',
+                arrowprops=dict(arrowstyle='->', color='green', lw=2))
+    
+    plt.tight_layout()
+    
+    # Adjust bottom margin to make room for model info
+    plt.subplots_adjust(bottom=0.2)
+    
+    plt.show()
+    
+    # Save the figure
+    plt.savefig('supervisor_comparison.png', dpi=300, bbox_inches='tight', facecolor='white')
+    print("Chart saved as 'supervisor_comparison.png'")
+    
+    return fig, best_df
+
+def print_summary_stats(best_df):
+    """Print rigorous summary statistics"""
+    
+    print("="*60)
+    print("DATA-DRIVEN SUMMARY FOR SUPERVISOR")
+    print("="*60)
+    
+    print("\n🏆 BEST RESULTS (automatically detected):")
+    for i, row in best_df.iterrows():
+        print(f"{i+1}. {row['setup']}: F1={row['test_f1']:.3f}, AUC={row['test_auc']:.3f}")
+        print(f"   Model: {row['model']}, Dataset: {row['dataset']}")
+        print(f"   Overfitting: {row['total_overfit']:.3f}")
+    
+    winner = best_df.loc[best_df['test_f1'].idxmax()]
+    best_overfit = best_df.loc[best_df['total_overfit'].idxmin()]
+    
+    print(f"\n🎯 KEY FINDINGS:")
+    print(f"• Best Performance: {winner['setup']} (F1={winner['test_f1']:.3f})")
+    print(f"• Best Generalization: {best_overfit['setup']} (overfitting={best_overfit['total_overfit']:.3f})")
+    
+    # Compare best vs Vol Δ + Lesion + Clinical if it exists
+    vlc_rows = best_df[best_df['setup'] == 'Vol ∆ + Lesion + Clinical']
+    if len(vlc_rows) > 0:
+        vlc_f1 = vlc_rows.iloc[0]['test_f1']
+        improvement = ((winner['test_f1'] / vlc_f1) - 1) * 100
+        print(f"• Performance improvement: {improvement:.1f}% over Vol Δ + Lesion + Clinical")
+
+# Run the analysis
+if __name__ == "__main__":
+    print("Creating data-driven supervisor comparison chart...")
+    fig, best_df = create_supervisor_comparison()
+    print_summary_stats(best_df)
+    print("\nRigorous, data-driven chart ready to send! 📊")
+
+# %% [markdown]
+# # Deeplearning Models for the Ablation Study
+
+# %%
+from torch import nn
+import torch
+from skorch.net import NeuralNet
+
+# Patch NeuralNet.__doc__ to avoid AttributeError in NeuralNetClassifier
+if NeuralNet.__doc__ is None:
+    NeuralNet.__doc__ = "Temporary docstring to avoid AttributeError in NeuralNetClassifier."
+
+from skorch.classifier import NeuralNetClassifier
+from skorch.callbacks import EarlyStopping
+
+#####################################
+# 🔹 Simple MLP Model with Tunable Layers
+#####################################
+class SimpleMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, dropout=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 2)  # binary classification output
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+#####################################
+# 🔹 Simple ResNet for Tabular Data
+#####################################
+class ResNetTabular(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, dropout=0.3):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        self.block1 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.shortcut = nn.Linear(hidden_dim, hidden_dim)
+
+        self.output = nn.Linear(hidden_dim, 2)
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        identity = x
+        out = self.block1(x)
+        out += self.shortcut(identity)
+        out = self.relu(out)
+        return self.output(out)
+
+
+#####################################
+# 🔹 TabNet Wrapper
+#####################################
+from pytorch_tabnet.tab_model import TabNetClassifier
+from sklearn.base import BaseEstimator, ClassifierMixin
+
+class TabNetSklearn(BaseEstimator, ClassifierMixin):
+    def __init__(self, input_dim=10, output_dim=2, **kwargs):
+        self.model = TabNetClassifier(input_dim=input_dim, output_dim=output_dim, **kwargs)
+
+    def fit(self, X, y):
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
+
+
+# %%
+## Dictionary for the three models
+
+# %%
+models = {
+    "MLP": lambda input_dim: NeuralNetClassifier(
+        module=SimpleMLP,
+        module__input_dim=input_dim,
+        max_epochs=100,
+        lr=0.001,
+        optimizer=torch.optim.Adam,
+        criterion=nn.CrossEntropyLoss,
+        callbacks=[EarlyStopping(patience=10)],
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        verbose=0
+    ),
+    "ResNet": lambda input_dim: NeuralNetClassifier(
+        module=ResNetTabular,
+        module__input_dim=input_dim,
+        max_epochs=100,
+        lr=0.001,
+        optimizer=torch.optim.Adam,
+        criterion=nn.CrossEntropyLoss,
+        callbacks=[EarlyStopping(patience=10)],
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        verbose=0
+    ),
+    "TabNet": lambda input_dim: TabNetSklearn(
+        input_dim=input_dim,
+        output_dim=2,
+        n_d=64,
+        n_a=64,
+        n_steps=5,
+        verbose=0,
+        seed=42,
+        device_name='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+}
+
+
+# %% [markdown]
+# # Ablation Study Results - Which combos are we doing (from Minimal -> to All Features)
+
+# %%
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+from sklearn.model_selection import train_test_split
+import numpy as np
+from tqdm import tqdm
+
+results_nn = []
+
+for setup_name, features in tqdm(ablation_setups.items(), desc="Neural Net Ablation"):
+    df_clean = df_train.dropna(subset=features + ["binary_response", "patient_id"])
+    X = df_clean[features].values.astype(np.float32)
+    y = df_clean["binary_response"].values.astype(np.int64)
+    groups = df_clean["patient_id"]
+    input_dim = X.shape[1]
+
+    # Split data for fair test evaluation
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, stratify=y, test_size=0.2, random_state=42
+    )
+
+    for model_name, model_fn in models.items():
+        print(f"Running {model_name} on setup: {setup_name}")
+        
+        if model_name == "TabNet":
+            clf = model_fn(input_dim)
+            clf.fit(X_train, y_train)
+            y_train_pred = clf.predict(X_train)
+            y_test_pred = clf.predict(X_test)
+            y_test_prob = clf.predict_proba(X_test)[:, 1]
+        else:
+            pipe = Pipeline([
+                ("scaler", StandardScaler()),
+                ("clf", model_fn(input_dim))
+            ])
+            pipe.fit(X_train, y_train)
+            y_train_pred = pipe.predict(X_train)
+            y_test_pred = pipe.predict(X_test)
+            y_test_prob = pipe.predict_proba(X_test)[:, 1]
+
+        # Record results
+        results_nn.append({
+            "Setup": setup_name,
+            "Model": model_name,
+            "Train_F1": f1_score(y_train, y_train_pred, average='macro'),
+            "Test_F1": f1_score(y_test, y_test_pred, average='macro'),
+            "Test_ROC_AUC": roc_auc_score(y_test, y_test_prob),
+            "Test_Accuracy": accuracy_score(y_test, y_test_pred),
+            "Overfit_Gap": f1_score(y_train, y_train_pred, average='macro') - f1_score(y_test, y_test_pred, average='macro')
+        })
+
+# Convert to DataFrame
+import pandas as pd
+results_nn_df = pd.DataFrame(results_nn).sort_values("Test_F1", ascending=False)
+
+
+# %%
+display(results_nn_df)
+
+results_df["Model_Type"] = "Classical"
+results_nn_df["Model_Type"] = "Neural"
+
+# Fill missing columns in results_nn_df with NaNs to match results_df
+for col in results_df.columns:
+    if col not in results_nn_df.columns:
+        results_nn_df[col] = np.nan
+
+# (Optional) If some cols exist in nn_df but not in results_df, you can drop or reorder
+results_nn_df = results_nn_df[results_df.columns]
+
+
+# %%
+combined_df = pd.concat([results_df, results_nn_df], ignore_index=True)
+# View top-performing models overall
+display(combined_df.sort_values("Test_F1", ascending=False))
+
+# Or group by Model_Type to compare classes vs neural nets
+display(combined_df.groupby("Model_Type").mean(numeric_only=True))
+
+
+
