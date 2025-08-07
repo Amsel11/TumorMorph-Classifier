@@ -102,11 +102,25 @@ def get_all_morph_feature_columns(df, include_deltas=True):
         all_cols.extend(delta_cols)
 
     return sorted(all_cols)
+def remap_labels(seg, label_map):
+    seg_remapped = seg.copy()
+    for old_label, new_label in label_map.items():
+        seg_remapped[seg == old_label] = new_label
+    return seg_remapped
 
-def compute_morph_features(df, features_to_compute, per_region=True, labels=[1, 2, 3], verbose=False):
+def compute_morph_features(df, features_to_compute, per_region=True, labels=[1, 2, 3], label_remap=None, verbose=False):
+# Import here to avoid path issues
+    import sys
+    import os
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.append(current_dir)
+
     from MorphFeatureClass import TumorMorphology
+    from fractal_analysis_clean import BrainTumorFractalAnalyzer  # Add this import
     import nibabel as nib
     from tqdm import tqdm
+
 
     morphology = TumorMorphology()
     all_rows = {}
@@ -122,6 +136,10 @@ def compute_morph_features(df, features_to_compute, per_region=True, labels=[1, 
             seg_path = pathlib.Path(row[path_col])
             try:
                 seg = nib.load(seg_path).get_fdata().astype(int)
+                
+                # Apply label remapping if provided
+                if label_remap:
+                    seg = remap_labels(seg, label_remap)
 
                 if "whole" in features_to_compute or not per_region:
                     mask = (seg > 0)
@@ -171,9 +189,14 @@ def _compute_features_for_mask(mask, features_to_compute, morphology):
             sa = morphology.calculate_surface_area(mask)
         res["compactness"] = morphology.calculate_compactness(mask.sum(), sa)
 
+    # CHANGE THIS PART:
+    import torch
     if "fractal" in features_to_compute:
-        fractal, _ = morphology.box_counting_3d_gpu(mask)
-        res["fractal"] = fractal
+        tensor_mask = torch.tensor(mask).float().to(morphology.device)
+        fd_3d, _, _, _ = morphology.fractal_analyzer.calculate_fractal_dimension(
+            tensor_mask, region_name="lesion"
+        )
+        res["fractal"] = fd_3d
 
     if "lacunarity" in features_to_compute:
         _, lac = morphology.box_counting_3d_gpu(mask)

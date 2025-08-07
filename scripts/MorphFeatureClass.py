@@ -1,18 +1,26 @@
 # Enhanced TumorMorphology Class with Integrated Lesion Analysis
 # ==============================================================
 # This integrates lesion analysis directly into the TumorMorphology class
-
+import os
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+scripts_path = os.path.join(current_dir, 'scripts')
+if scripts_path not in sys.path:
+    sys.path.append(scripts_path)
 import numpy as np
 import torch
 from scipy.stats import linregress
 from scipy import ndimage
 from typing import Dict, List, Optional, Tuple, Union
 import nibabel as nib
+from fractal_analysis_clean import BrainTumorFractalAnalyzer
+
 class TumorMorphology:
     """Enhanced TumorMorphology class with integrated lesion analysis"""
     
-    def __init__(self, use_gpu=True):
+    def __init__(self, use_gpu=True, label_remap=None):
         self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.label_remap = label_remap or {}
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         
         if self.use_gpu:
@@ -24,11 +32,23 @@ class TumorMorphology:
             2: 50,   # necrotic  
             3: 200   # edema
         }
+        
+        # Create fractal analyzer
+        self.fractal_analyzer = BrainTumorFractalAnalyzer(
+            apply_morphological_correction=True,
+            verbose=True
+        )
+
     
     # ==========================================================================
     # EXISTING MORPHOLOGY METHODS (keeping your original functionality)
     # ==========================================================================
-    
+    def remap_labels(self, seg):
+        seg_remapped = seg.copy()
+        for old_label, new_label in self.label_remap.items():
+            seg_remapped[seg == old_label] = new_label
+        return seg_remapped
+
     def box_count_2d_gpu(self, data_tensor, box_size):
         """GPU 2D box counting (existing method)"""
         H, W = data_tensor.shape
@@ -374,10 +394,15 @@ class TumorMorphology:
                 )
             
             # Fractal analysis (only for larger lesions due to computational cost)
-            if lesion_volume > 1000:  # Arbitrary threshold
-                fd_3d, lac_3d = self.box_counting_3d_gpu(lesion_mask)
+            # Fractal analysis (only for larger lesions due to computational cost)
+            if lesion_volume > 1000:
+                tensor_lesion = torch.tensor(lesion_mask).float().to(self.device)
+                fd_3d, _, _, _ = self.fractal_analyzer.calculate_fractal_dimension(tensor_lesion, region_name="lesion")
+                lac_3d = self.calculate_robust_lacunarity(lesion_mask.flatten())
+
                 lesion_morph['fractal_3d'] = fd_3d
                 lesion_morph['lacunarity_3d'] = lac_3d
+
             
             lesion_morphologies.append(lesion_morph)
         
@@ -409,28 +434,33 @@ class TumorMorphology:
     # ==========================================================================
     
     def calculate_surface_area(self, binary_volume):
-        """Calculate surface area using face counting (existing method)"""
+        """Calculate surface area using marching cubes algorithm"""
+        from skimage.measure import marching_cubes
+        
         if not np.any(binary_volume):
             return 0
         
-        surface_area = 0
-        d, h, w = binary_volume.shape
+        try:
+            # Generate mesh using marching cubes
+            verts, faces, normals, values = marching_cubes(
+                binary_volume.astype(float), 
+                level=0.5,
+                spacing=(1.0, 1.0, 1.0)
+            )
+            
+            # Calculate area of each triangle face
+            areas = []
+            for face in faces:
+                v0, v1, v2 = verts[face]
+                # Cross product for triangle area
+                area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+                areas.append(area)
+            
+            return np.sum(areas)
         
-        for i in range(d):
-            for j in range(h):
-                for k in range(w):
-                    if binary_volume[i, j, k]:
-                        neighbors = [
-                            (i-1, j, k), (i+1, j, k),
-                            (i, j-1, k), (i, j+1, k),
-                            (i, j, k-1), (i, j, k+1)
-                        ]
-                        for ni, nj, nk in neighbors:
-                            if (ni < 0 or ni >= d or nj < 0 or nj >= h or 
-                                nk < 0 or nk >= w or not binary_volume[ni, nj, nk]):
-                                surface_area += 1
-        
-        return surface_area
+        except Exception:
+            # Fallback to simple face counting if marching cubes fails
+            return np.sum(binary_volume)  # Rough    approximation
     
     def calculate_compactness(self, volume, surface_area):
         """Calculate compactness (sphericity) (existing method)"""
@@ -443,26 +473,23 @@ class TumorMorphology:
     # ==========================================================================
     
     def calculate_complete_morphology_with_lesions(self, seg1: np.ndarray, seg2: np.ndarray, 
-                                                  labels: List[int] = [1, 2, 3]) -> Dict:
+                                                labels: List[int] = [1, 2, 3]) -> Dict:
         """
         Complete morphological analysis including lesion analysis
-        
+
         Args:
             seg1: Baseline segmentation
-            seg2: Followup segmentation
+            seg2: Follow-up segmentation
             labels: Labels to analyze
-            
+
         Returns:
-            Complete morphological and lesion analysis
+            Dictionary with morphological and lesion analysis results
         """
-        
-        # Fix label mapping if needed (existing functionality)
-        seg2_fixed = seg2.copy()
-        if 4 in np.unique(seg2):
-            seg2_fixed[seg2 == 2] = 3  # edema
-            seg2_fixed[seg2 == 1] = 2  # necrotic  
-            seg2_fixed[seg2 == 4] = 1  # enhancing
-        
+
+        # ✅ 1. Apply label remapping to both segmentations if specified
+   
+
+
         results = {
             'morphology': {
                 'volumes': {'seg1': {}, 'seg2': {}},
@@ -474,54 +501,123 @@ class TumorMorphology:
             'lesion_analysis': {},
             'lesion_changes': {}
         }
-        
-        # Traditional morphological analysis (existing functionality)
+
+        # ✅ 2. Traditional morphological & lesion analysis
         for label in labels:
-            for seg_name, seg in [('seg1', seg1), ('seg2', seg2_fixed)]:
+            for seg_name, seg in [('seg1', seg1), ('seg2', seg2)]:
                 mask = (seg == label).astype(bool)
-                
+
                 if np.any(mask):
                     # Volume
                     volume = int(np.sum(mask))
                     results['morphology']['volumes'][seg_name][f'label_{label}'] = volume
-                    
+
                     # Surface area
                     surface_area = self.calculate_surface_area(mask)
                     results['morphology']['surface_areas'][seg_name][f'label_{label}'] = surface_area
-                    
+
+                    # Fractal dimension
+                    tensor_mask = torch.tensor(mask).float().to(self.device)
+                    fd_3d, _, _, _ = self.fractal_analyzer.calculate_fractal_dimension(
+                        tensor_mask, region_name=f'label_{label}'
+                    )
+
+                    # Lacunarity
+                    lacunarity_3d = self.calculate_robust_lacunarity(mask.flatten())
+
+                    results['morphology']['fractal_3d'][seg_name][f'label_{label}'] = fd_3d
+                    results['morphology']['lacunarity_3d'][seg_name][f'label_{label}'] = lacunarity_3d
+
                     # Compactness
                     compactness = self.calculate_compactness(volume, surface_area)
                     results['morphology']['compactness'][seg_name][f'label_{label}'] = compactness
-                    
-                    # 3D fractal analysis
-                    fd_3d, lac_3d = self.box_counting_3d_gpu(mask)
-                    results['morphology']['fractal_3d'][seg_name][f'label_{label}'] = fd_3d
-                    results['morphology']['lacunarity_3d'][seg_name][f'label_{label}'] = lac_3d
-                    
-                    # NEW: Lesion analysis
+
+                    # Lesion morphology
                     lesion_morph = self.calculate_lesion_morphology(mask)
                     results['lesion_analysis'][f'{seg_name}_label_{label}'] = lesion_morph
-        
-        # NEW: Lesion change analysis
-        results['lesion_changes'] = self.analyze_lesion_changes(seg1, seg2_fixed, labels)
-        
+
+        # ✅ 3. Lesion change analysis
+        results['lesion_changes'] = self.analyze_lesion_changes(seg1, seg2, labels)
+
         return results
+
 
 # ==========================================================================
 # USAGE EXAMPLE
 # ==========================================================================
+def compute_fractal_by_label(seg, device, fractal_analyzer, labels=[1, 2, 3], seg_name='seg1'):
+    """Quick full-region FD calculator (no lesion separation)"""
+    print(f"\n🧠 Fractal Dimensions for {seg_name}:")
+
+    def to_scalar(x, name='value'):
+        try:
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu().numpy()
+            if isinstance(x, np.ndarray):
+                if x.size == 1:
+                    return x.item()
+                elif x.ndim == 1:
+                    print(f"  ⚠️ {name} is 1D array with size {x.size}, taking first element")
+                    return float(x[0])
+                else:
+                    raise ValueError(f"{name} has unexpected shape: {x.shape}")
+            return float(x)
+        except Exception as e:
+            raise ValueError(f"Failed to convert {name} to scalar: {e}")
+
+    for label in labels:
+        mask = (seg == label)
+        if np.any(mask):
+            # Print bounding box and reduction info for this label
+            nonzero_coords = np.array(mask.nonzero())
+            if nonzero_coords.shape[1] == 0:
+                bbox_shape = (0, 0, 0)
+                reduction = 0.0
+            else:
+                bbox_shape = tuple(np.ptp(nonzero_coords, axis=1) + 1)
+                reduction = np.prod(mask.shape) / np.prod(bbox_shape)
+            print(
+                f"label_{label}: Volume {mask.shape} -> {bbox_shape} "
+                f"({reduction:.1f}x reduction, {np.count_nonzero(mask):,} voxels)"
+            )
+            try:
+                tensor_mask = torch.tensor(mask).float().to(device)
+                fd, r2, scale_range, _ = fractal_analyzer.calculate_fractal_dimension(
+                    tensor_mask, region_name=f'label_{label}'
+                )
+
+                # 🩺 Robust scalar conversion
+                fd = to_scalar(fd, name='FD')
+                r2 = to_scalar(r2, name='R²')
+                scale_range = to_scalar(scale_range, name='Scale range')
+
+                print(f"  Label {label}: FD = {fd:.4f}, R² = {r2:.4f}, Scale range = {scale_range}")
+            except Exception as e:
+                print(f"  Label {label}: ❌ Error computing FD — {e}")
+        else:
+            print(f"  Label {label}: ⚠️ Empty region")
+
+
 
 def example_enhanced_usage():
     """Example of using enhanced TumorMorphology with integrated lesion analysis"""
     
     # Create enhanced morphology analyzer
-    morphology = TumorMorphology(use_gpu=True)
+    label_remap = {1:2, 2:3, 3:1}
+    morphology = TumorMorphology(use_gpu=True, label_remap=label_remap)
+    
     
     # Load segmentations (example)
     baseline_seg = nib.load('/gpfs/data/oermannlab/users/schula12/Morphology/Lumiere/segmentations_swin/swin_Patient-001_week-000-2.nii.gz').get_fdata().astype(int)
     print('I am here')
     followup_seg = nib.load('/gpfs/data/oermannlab/users/schula12/Morphology/Lumiere/segmentations_swin/swin_Patient-001_week-044.nii.gz').get_fdata().astype(int)
-    
+    # Fractal-only analysis per label (NO lesion separation)
+    if hasattr(morphology, 'label_remap') and morphology.label_remap:
+        print(f"🔁 Applying label remapping: {morphology.label_remap}")
+        baseline_seg = morphology.remap_labels(baseline_seg)
+        followup_seg = morphology.remap_labels(followup_seg)
+    compute_fractal_by_label(baseline_seg, morphology.device, morphology.fractal_analyzer, seg_name='Baseline')
+    compute_fractal_by_label(followup_seg, morphology.device, morphology.fractal_analyzer, seg_name='Follow-up')
     # Complete analysis with integrated lesion analysis
     results = morphology.calculate_complete_morphology_with_lesions(baseline_seg, followup_seg)
     
